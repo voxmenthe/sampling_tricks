@@ -4,14 +4,21 @@ from typing import List, Tuple, Callable
 
 @jax.jit
 def calculate_entropy(probs: jax.Array) -> jax.Array:
+    """
+    Calculate the entropy of a probability distribution.
+    """
     return -jnp.sum(jnp.where(probs > 0, probs * jnp.log(probs), probs * jnp.log(probs), 0), axis=-1)
 
-
-
 def calculate_varentropy(entropy_history: jax.Array) -> float:
+    """
+    Calculate the variance of entropy over time.
+    """
     return jnp.var(entropy_history)
 
 def beam_search(logits: jax.Array, beam_width: int, max_steps: int, model_fn: Callable, temperature: float) -> jax.Array:
+    """
+    Perform beam search to find the best sequence of tokens.
+    """
     def beam_step(beam_state, _):
         current_sequences, current_scores, current_logits = beam_state
         next_token_logits = jax.vmap(model_fn)(current_sequences)
@@ -45,7 +52,9 @@ def cot_sampler(
     max_beam_steps: int = 10,
     entropy_threshold: float = 2.0,
     varentropy_threshold: float = 0.5,
-    backspace_penalty: float = 0.1
+    backspace_penalty: float = 0.1,
+    use_dynamic_threshold: bool = True,
+    noise_scale: float = 0.1
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Advanced CoT (Chain of Thought) sampler that dynamically adapts sampling strategies
@@ -55,37 +64,10 @@ def cot_sampler(
     both the entropy of the current token distribution and the variance of entropy over time
     (varentropy). It dynamically switches between four strategies based on the current state:
 
-    1. Argmax (Low Entropy, Low Varentropy):
-       - When the model is very confident and stable.
-       - Action: Use argmax sampling or very low temperature sampling.
-       - Rationale: The model is consistently predicting a specific token with high confidence.
-
-    2. Branch (High Entropy, High Varentropy):
-       - When the model is uncertain and unstable.
-       - Action: Use beam search to explore multiple paths.
-       - Rationale: The model is considering many options and the distribution is changing
-         rapidly, so exploring multiple possibilities is beneficial.
-
-    3. CoT (Chain of Thought) (High Entropy, Low Varentropy):
-       - When the model is uncertain but stable in its uncertainty.
-       - Action: Inject CoT tokens to encourage step-by-step reasoning.
-       - Rationale: The model is consistently unsure, so prompting it to break down its
-         reasoning may help.
-
-    4. Backspace (Low Entropy, High Varentropy):
-       - When the model is confident but unstable in its confidence.
-       - Action: Consider backtracking or regenerating the last few tokens.
-       - Rationale: The model might be stuck in a local optimum or rapidly changing its
-         mind about what should come next.
-
-    This approach offers several advantages:
-    - Adaptivity: The sampling strategy adapts in real-time to the model's state.
-    - Balanced exploration and exploitation: It balances between exploiting the model's
-      confidence and exploring when the model is uncertain.
-    - Handling edge cases: It provides strategies for dealing with potentially problematic
-      situations, like when the model is overly confident but unstable.
-    - Improved control: By considering both entropy and varentropy, we have a more nuanced
-      view of the model's behavior, allowing for finer-grained control over the generation process.
+    1. Argmax (Low Entropy, Low Varentropy)
+    2. Branch (High Entropy, High Varentropy)
+    3. CoT (Chain of Thought) (High Entropy, Low Varentropy)
+    4. Backspace (Low Entropy, High Varentropy)
 
     Args:
         logits: A JAX array of shape (batch_size, vocab_size) representing the logits of the distribution.
@@ -102,6 +84,8 @@ def cot_sampler(
         entropy_threshold: Threshold to distinguish between high and low entropy.
         varentropy_threshold: Threshold to distinguish between high and low varentropy.
         backspace_penalty: Penalty factor for the backspace action.
+        use_dynamic_threshold: Whether to use a dynamic entropy threshold.
+        noise_scale: Scale of the noise to add during branching.
 
     Returns:
         A tuple containing:
@@ -119,6 +103,12 @@ def cot_sampler(
     def is_appropriate_injection_point(previous_token, tokens_since_last_injection):
         return (previous_token in punctuation_tokens) and (tokens_since_last_injection >= injection_cooldown)
 
+    def dynamic_entropy_threshold(current_entropy, history, alpha=0.1):
+        if not len(history):
+            return current_entropy
+        moving_avg = sum(history) / len(history)
+        return alpha * current_entropy + (1 - alpha) * moving_avg
+
     def sample_with_quadrants(carry, _):
         current_logits, current_key, cot_injection_count, previous_token, tokens_since_last_injection, entropy_history = carry
         
@@ -128,7 +118,8 @@ def cot_sampler(
         varentropy = calculate_varentropy(entropy_history)
         
         # Determine the current quadrant
-        low_entropy = entropy < entropy_threshold
+        current_threshold = dynamic_entropy_threshold(entropy, entropy_history) if use_dynamic_threshold else entropy_threshold
+        low_entropy = entropy < current_threshold
         low_varentropy = varentropy < varentropy_threshold
         
         # Sampling strategies for each quadrant
@@ -136,7 +127,12 @@ def cot_sampler(
             return jnp.argmax(current_logits, axis=-1)
         
         def branch_strategy():
-            return beam_search(current_logits, beam_width, max_beam_steps, model_fn, temperature)[-1]
+            # Add noise and adjust temperature for branching
+            key1, key2 = jax.random.split(current_key)
+            noise = jax.random.normal(key1, shape=current_logits.shape) * noise_scale
+            branch_temperature = temperature * (1 + jax.random.uniform(key2, minval=-0.1, maxval=0.1))
+            noisy_logits = current_logits + noise
+            return beam_search(noisy_logits, beam_width, max_beam_steps, model_fn, branch_temperature)[-1]
         
         def cot_strategy():
             appropriate_point = is_appropriate_injection_point(previous_token, tokens_since_last_injection)
@@ -199,7 +195,9 @@ def entropy_based_quadrant_sampling(
     max_beam_steps: int = 10,
     entropy_threshold: float = 2.0,
     varentropy_threshold: float = 0.5,
-    backspace_penalty: float = 0.1
+    backspace_penalty: float = 0.1,
+    use_dynamic_threshold: bool = True,
+    noise_scale: float = 0.1
 ) -> Tuple[jax.Array, jax.Array]:
     """
     JIT-compiled version of the advanced cot_sampler function for faster execution.
@@ -207,7 +205,8 @@ def entropy_based_quadrant_sampling(
     return cot_sampler(
         logits, key, model_fn, num_samples, temperature, cot_tokens,
         max_cot_injections, injection_cooldown, punctuation_tokens,
-        beam_width, max_beam_steps, entropy_threshold, varentropy_threshold, backspace_penalty
+        beam_width, max_beam_steps, entropy_threshold, varentropy_threshold, backspace_penalty,
+        use_dynamic_threshold, noise_scale
     )
 
 def generate_with_quadrant_cot(
@@ -224,7 +223,9 @@ def generate_with_quadrant_cot(
     max_beam_steps: int = 10,
     entropy_threshold: float = 2.0,
     varentropy_threshold: float = 0.5,
-    backspace_penalty: float = 0.1
+    backspace_penalty: float = 0.1,
+    use_dynamic_threshold: bool = True,
+    noise_scale: float = 0.1
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Generate a sequence using the model function and quadrant-based CoT sampling.
@@ -258,7 +259,9 @@ def generate_with_quadrant_cot(
             max_beam_steps=max_beam_steps,
             entropy_threshold=entropy_threshold,
             varentropy_threshold=varentropy_threshold,
-            backspace_penalty=backspace_penalty
+            backspace_penalty=backspace_penalty,
+            use_dynamic_threshold=use_dynamic_threshold,
+            noise_scale=noise_scale
         )
         new_tokens = jnp.concatenate([tokens, new_token.T], axis=1)
         new_cot_injection_count = cot_injection_count + (strategy_used[0, 0] == 2).astype(jnp.int32)
@@ -272,7 +275,7 @@ def generate_with_quadrant_cot(
         jnp.array(0, dtype=jnp.int32),
         jnp.full((1,), -1, dtype=jnp.int32),
         jnp.full((1,), injection_cooldown, dtype=jnp.int32),
-        jnp.full((10,), entropy_threshold)  # Initial entropy history
+        jnp.full((10,), entropy_threshold)  # Initial entropy
     )
     _, (generated_tokens, strategies_used) = jax.lax.scan(
         body_fn,
@@ -281,4 +284,4 @@ def generate_with_quadrant_cot(
         length=max_length - initial_tokens.shape[1]
     )
     
-    return generated_tokens[-1], strategies_used
+    return generated_tokens[-1], strategies_used[-1]
